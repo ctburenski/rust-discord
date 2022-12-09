@@ -1,22 +1,42 @@
 #[macro_use]
 extern crate log;
 
-use std::{error::Error, fs};
+use std::{error::Error, fs, sync::Arc, time::Duration};
 
-use futures_util::{SinkExt, StreamExt};
+use futures_util::{stream::SplitSink, SinkExt, StreamExt};
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
-use serde_json;
-use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+use serde_json::{self, Value};
+use tokio::{
+    net::TcpStream,
+    select,
+    sync::{
+        mpsc::{channel, Sender},
+        Mutex,
+    },
+};
+use tokio_tungstenite::{tungstenite::client::IntoClientRequest, MaybeTlsStream, WebSocketStream};
 
 pub struct Bot {
     config: Config,
     gateway_url: Option<String>,
     session_starts_remaining: Option<isize>,
     session_starts_total: Option<isize>,
+    heartbeat_interval: Arc<Mutex<Option<isize>>>,
+    websocket: Arc<
+        Mutex<
+            Option<
+                SplitSink<
+                    WebSocketStream<MaybeTlsStream<TcpStream>>,
+                    tokio_tungstenite::tungstenite::Message,
+                >,
+            >,
+        >,
+    >,
 }
 
 impl Bot {
+    /// Creates a new instance of a Bot
     pub fn new(config_file: &str) -> Result<Bot, Box<dyn Error>> {
         let config = fs::read_to_string(config_file)?;
         trace!("Read config from {}", config_file);
@@ -26,15 +46,53 @@ impl Bot {
             gateway_url: None,
             session_starts_remaining: None,
             session_starts_total: None,
+            heartbeat_interval: Arc::new(Mutex::new(None)),
+            websocket: Arc::new(Mutex::new(None)),
         });
     }
 
     pub async fn run(self) {
-        self.initialize().await.expect("Failed to initialize")
+        let (tx, mut rx) = channel::<()>(100);
+        let websocket = self.websocket.clone();
+        let heartbeat_interval = self.heartbeat_interval.clone();
+        tokio::spawn(async move {
+            rx.recv().await;
+            trace!("Started sending regular heartbeat...");
+            loop {
+                let heartbeat_interval = heartbeat_interval.lock().await;
+                select! {
+                    _ = {rx.recv() } => {
+                    },
+                    _ = {
+                        trace!("Heartbeat should be positive: {}", heartbeat_interval.unwrap());
+                        tokio::time::sleep(Duration::from_millis(heartbeat_interval.unwrap().try_into().unwrap()))
+                    } => {}
+                }
+                let message = tokio_tungstenite::tungstenite::Message::Text(
+                    serde_json::json!(
+                        {
+                            "op": 1,
+                            "d": heartbeat_interval.unwrap()
+                        }
+                    )
+                    .to_string(),
+                );
+                websocket
+                    .lock()
+                    .await
+                    .as_mut()
+                    .unwrap()
+                    .send(message)
+                    .await
+                    .expect("Could not send initial heartbeat message");
+                trace!("Heartbeat sent");
+            }
+        });
+        self.initialize(tx).await.expect("Failed to initialize")
     }
 
-    async fn initialize(mut self) -> Result<(), Box<dyn Error>> {
-        // TODO mapp all the errors in this instead of using except
+    async fn initialize(mut self, tx: Sender<()>) -> Result<(), Box<dyn Error>> {
+        // TODO map all the errors in this instead of using except
         // eventually should return enums
         // sending a request to get the URL for the bot gateway
         let response = Client::new()
@@ -119,6 +177,76 @@ impl Bot {
 
         let (ws, _) = gateway_connection;
         let (sink, mut stream) = ws.split();
+        *self.websocket.lock().await = Some(sink);
+
+        while let Some(m) = stream.next().await {
+            if let Ok(msg) = &m {
+                trace!("Message received from Gateway: {}", msg.to_string());
+                let msg = serde_json::from_str::<Message>(&msg.to_string())?;
+
+                match msg.op {
+                    // dispatch code
+                    0 => continue,
+                    // heartbeat
+                    1 => continue,
+                    // identify
+                    2 => continue,
+                    // presence update
+                    3 => continue,
+                    // voice state update
+                    4 => continue,
+                    // resume
+                    6 => continue,
+                    // reconnect
+                    7 => continue,
+                    // guild member request
+                    8 => continue,
+                    // invalid session
+                    9 => continue,
+                    // hello
+                    10 => {
+                        trace!("Received hello event!");
+                        *self.heartbeat_interval.lock().await = Some(
+                            msg.d
+                                .unwrap()
+                                .get("heartbeat_interval")
+                                .expect("Could not get heartbeat interval from hello message")
+                                .to_string()
+                                .parse::<isize>()
+                                .unwrap(),
+                        );
+                        trace!(
+                            "Heartbeat interval: {}",
+                            self.heartbeat_interval.lock().await.unwrap()
+                        );
+                        let message = tokio_tungstenite::tungstenite::Message::Text(
+                            serde_json::json!(
+                                {
+                                    "op": 1,
+                                    "d": self.heartbeat_interval.lock().await.unwrap()
+                                }
+                            )
+                            .to_string(),
+                        );
+                        self.websocket
+                            .lock()
+                            .await
+                            .as_mut()
+                            .unwrap()
+                            .send(message)
+                            .await
+                            .expect("Could not send initial heartbeat message");
+                        tx.send(()).await?;
+                        trace!("Hello event was ok, initial heartbeat sent");
+                        continue;
+                    }
+                    // heartbeat acknowledged
+                    // TODO will have to handle not receiving this event when expecting to
+                    11 => continue,
+                    _ => continue,
+                }
+            }
+        }
 
         return Ok(());
     }
@@ -127,4 +255,23 @@ impl Bot {
 #[derive(Serialize, Deserialize)]
 struct Config {
     token: String,
+}
+
+#[derive(Serialize, Deserialize)]
+struct Message {
+    op: isize,
+    d: Option<Value>,
+    s: Option<isize>,
+    t: Option<String>,
+}
+
+#[derive(Serialize, Deserialize)]
+struct HeartbeatMessage {
+    op: isize,
+    d: HeartbeatData,
+}
+
+#[derive(Serialize, Deserialize)]
+struct HeartbeatData {
+    heartbeat_interval: isize,
 }
