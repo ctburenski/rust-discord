@@ -6,7 +6,7 @@ use rust_discord::Bot;
 #[tokio::main]
 async fn main() {
     env_logger::init();
-    let bot = Bot::new("config.json").expect("Failed to read config");
+    let bot = Bot::new("config.json");
 
     bot.run().await
 }

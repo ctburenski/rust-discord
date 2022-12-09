@@ -1,12 +1,11 @@
 #[macro_use]
 extern crate log;
 
-use std::{error::Error, fs, sync::Arc, time::Duration};
-
 use futures_util::{stream::SplitSink, SinkExt, StreamExt};
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use serde_json::{self, Value};
+use std::{error::Error, fs, sync::Arc, time::Duration};
 use tokio::{
     net::TcpStream,
     select,
@@ -17,57 +16,74 @@ use tokio::{
 };
 use tokio_tungstenite::{tungstenite::client::IntoClientRequest, MaybeTlsStream, WebSocketStream};
 
+// type alias for a long type name
+type WebSocketSinkHandle =
+    SplitSink<WebSocketStream<MaybeTlsStream<TcpStream>>, tokio_tungstenite::tungstenite::Message>;
+
 pub struct Bot {
     config: Config,
     gateway_url: Option<String>,
     session_starts_remaining: Option<isize>,
     session_starts_total: Option<isize>,
     heartbeat_interval: Arc<Mutex<Option<isize>>>,
-    websocket: Arc<
-        Mutex<
-            Option<
-                SplitSink<
-                    WebSocketStream<MaybeTlsStream<TcpStream>>,
-                    tokio_tungstenite::tungstenite::Message,
-                >,
-            >,
-        >,
-    >,
+    websocket: Arc<Mutex<Option<WebSocketSinkHandle>>>,
 }
 
 impl Bot {
     /// Creates a new instance of a Bot
-    pub fn new(config_file: &str) -> Result<Bot, Box<dyn Error>> {
-        let config = fs::read_to_string(config_file)?;
+    ///
+    /// # Panics
+    /// Will panic if it cannot acccess the config file or if that file is not valid JSON with a 'token' field
+    pub fn new(config_file: &str) -> Bot {
+        let config = fs::read_to_string(config_file)
+            .expect(&format!("Failed to read config file: {}", config_file));
         trace!("Read config from {}", config_file);
-        let config = serde_json::from_str::<Config>(&config)?;
-        return Ok(Bot {
+
+        let config = serde_json::from_str::<Config>(&config)
+            .expect("Config was not the valid format - should be valid JSON with a 'token' field.");
+
+        Bot {
             config,
             gateway_url: None,
             session_starts_remaining: None,
             session_starts_total: None,
             heartbeat_interval: Arc::new(Mutex::new(None)),
             websocket: Arc::new(Mutex::new(None)),
-        });
+        }
     }
 
     pub async fn run(self) {
+        // We use this channel to alert the heartbeat loop
+        // to begin sending the heartbeat at regular intervals
         let (tx, mut rx) = channel::<()>(100);
+
+        // clone these two to send to the async task
         let websocket = self.websocket.clone();
         let heartbeat_interval = self.heartbeat_interval.clone();
+
+        // this async tasks just lives on its own from now on
+        // it only cares about the channels it has and the
+        // copies of the heartbeat interval and the sink
+        //
+        // TODO maybe this should be in the initialize method?
         tokio::spawn(async move {
+            // wait before beginning the heartbeat loop
             rx.recv().await;
             trace!("Started sending regular heartbeat...");
             loop {
+                // get the time to wait
                 let heartbeat_interval = heartbeat_interval.lock().await;
+                // TODO his doesn't know which awaitable task returns
                 select! {
                     _ = {rx.recv() } => {
                     },
                     _ = {
-                        trace!("Heartbeat should be positive: {}", heartbeat_interval.unwrap());
+                        // wait for the time between heartbeats
+                        // TODO, is this the right idea?
                         tokio::time::sleep(Duration::from_millis(heartbeat_interval.unwrap().try_into().unwrap()))
                     } => {}
                 }
+                // create the heartbeat message
                 let message = tokio_tungstenite::tungstenite::Message::Text(
                     serde_json::json!(
                         {
@@ -77,6 +93,8 @@ impl Bot {
                     )
                     .to_string(),
                 );
+                // send the message - also, this method chaining is a bit much
+                // TODO - maybe we should reduce the need for so many methods
                 websocket
                     .lock()
                     .await
@@ -91,6 +109,8 @@ impl Bot {
         self.initialize(tx).await.expect("Failed to initialize")
     }
 
+    /// initialize will get the bot connected to the gateway and sending regular
+    /// heartbeats
     async fn initialize(mut self, tx: Sender<()>) -> Result<(), Box<dyn Error>> {
         // TODO map all the errors in this instead of using except
         // eventually should return enums
@@ -153,10 +173,7 @@ impl Bot {
             return Err("Session start limit reached!".into());
         }
 
-        trace!(
-            "{}/?v=10&encoding=json",
-            self.gateway_url.as_ref().clone().unwrap()
-        );
+        trace!("{}/?v=10&encoding=json", self.gateway_url.as_ref().unwrap());
 
         // connect to gateway
         let gateway_connection = tokio_tungstenite::connect_async(
@@ -164,7 +181,6 @@ impl Bot {
                 "{}/?v=10&encoding=json",
                 self.gateway_url
                     .as_ref()
-                    .clone()
                     .expect("No URL stored for gateway")
             )
             .into_client_request()
@@ -179,11 +195,15 @@ impl Bot {
         let (sink, mut stream) = ws.split();
         *self.websocket.lock().await = Some(sink);
 
+        // this is the event listener, and maybe should be in it's own
+        // method or function
         while let Some(m) = stream.next().await {
             if let Ok(msg) = &m {
                 trace!("Message received from Gateway: {}", msg.to_string());
                 let msg = serde_json::from_str::<Message>(&msg.to_string())?;
 
+                // maybe matching these methods to an enum instead of
+                // just using code comments would be better?
                 match msg.op {
                     // dispatch code
                     0 => continue,
@@ -248,10 +268,11 @@ impl Bot {
             }
         }
 
-        return Ok(());
+        Ok(())
     }
 }
 
+// TODO we should make sure this token is never logged
 #[derive(Serialize, Deserialize)]
 struct Config {
     token: String,
