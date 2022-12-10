@@ -1,16 +1,20 @@
+mod gateway;
+
 #[macro_use]
 extern crate log;
 
-use futures_util::{stream::SplitSink, SinkExt, StreamExt};
+use futures_util::{
+    stream::{SplitSink, SplitStream},
+    SinkExt, StreamExt,
+};
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
-use serde_json::{self, Value};
 use std::{error::Error, fs, sync::Arc, time::Duration};
 use tokio::{
     net::TcpStream,
     select,
     sync::{
-        mpsc::{channel, Sender},
+        mpsc::{channel, Receiver, Sender},
         Mutex,
     },
 };
@@ -20,13 +24,16 @@ use tokio_tungstenite::{tungstenite::client::IntoClientRequest, MaybeTlsStream, 
 type WebSocketSinkHandle =
     SplitSink<WebSocketStream<MaybeTlsStream<TcpStream>>, tokio_tungstenite::tungstenite::Message>;
 
+type WebSocketStreamHandle = SplitStream<WebSocketStream<MaybeTlsStream<TcpStream>>>;
+
 pub struct Bot {
     config: Config,
     gateway_url: Option<String>,
     session_starts_remaining: Option<isize>,
     session_starts_total: Option<isize>,
     heartbeat_interval: Arc<Mutex<Option<isize>>>,
-    websocket: Arc<Mutex<Option<WebSocketSinkHandle>>>,
+    websocket_sink: Arc<Mutex<Option<WebSocketSinkHandle>>>,
+    websocket_stream: Arc<Mutex<Option<WebSocketStreamHandle>>>,
 }
 
 impl Bot {
@@ -37,6 +44,7 @@ impl Bot {
     pub fn new(config_file: &str) -> Bot {
         let config = fs::read_to_string(config_file)
             .expect(&format!("Failed to read config file: {}", config_file));
+
         trace!("Read config from {}", config_file);
 
         let config = serde_json::from_str::<Config>(&config)
@@ -48,24 +56,18 @@ impl Bot {
             session_starts_remaining: None,
             session_starts_total: None,
             heartbeat_interval: Arc::new(Mutex::new(None)),
-            websocket: Arc::new(Mutex::new(None)),
+            websocket_sink: Arc::new(Mutex::new(None)),
+            websocket_stream: Arc::new(Mutex::new(None)),
         }
     }
 
-    pub async fn run(self) {
-        // We use this channel to alert the heartbeat loop
-        // to begin sending the heartbeat at regular intervals
-        let (tx, mut rx) = channel::<()>(100);
-
-        // clone these two to send to the async task
-        let websocket = self.websocket.clone();
+    pub fn send_heartbeat(&self, mut rx: Receiver<()>) {
+        let websocket = self.websocket_sink.clone();
         let heartbeat_interval = self.heartbeat_interval.clone();
 
         // this async tasks just lives on its own from now on
         // it only cares about the channels it has and the
         // copies of the heartbeat interval and the sink
-        //
-        // TODO maybe this should be in the initialize method?
         tokio::spawn(async move {
             // wait before beginning the heartbeat loop
             rx.recv().await;
@@ -75,6 +77,7 @@ impl Bot {
                 let heartbeat_interval = heartbeat_interval.lock().await;
                 // TODO his doesn't know which awaitable task returns
                 select! {
+                    // TODO this just causes the delay to short circuit but this isn't what we want
                     _ = {rx.recv() } => {
                     },
                     _ = {
@@ -99,19 +102,109 @@ impl Bot {
                     .lock()
                     .await
                     .as_mut()
-                    .unwrap()
+                    .expect("Expected to get WebSocket, got nothing instead")
                     .send(message)
                     .await
                     .expect("Could not send initial heartbeat message");
+
                 trace!("Heartbeat sent");
             }
         });
-        self.initialize(tx).await.expect("Failed to initialize")
+    }
+
+    pub fn gateway_listener(&self, tx: Sender<()>) {
+        let websocket_stream = self.websocket_stream.clone();
+        let heartbeat_interval = self.heartbeat_interval.clone();
+        let websocket_sink = self.websocket_sink.clone();
+        tokio::spawn(async move {
+            let mut websocket_stream = websocket_stream.lock().await;
+
+            while let Some(m) = websocket_stream.as_mut().unwrap().next().await {
+                if let Ok(msg) = &m {
+                    trace!("Message received from Gateway: {}", msg.to_string());
+                    let msg = serde_json::from_str::<gateway::Message>(&msg.to_string()).unwrap();
+
+                    // maybe matching these methods to an enum instead of
+                    // just using code comments would be better?
+                    match msg.op {
+                        // dispatch code
+                        0 => continue,
+                        // heartbeat
+                        1 => continue,
+                        // identify
+                        2 => continue,
+                        // presence update
+                        3 => continue,
+                        // voice state update
+                        4 => continue,
+                        // resume
+                        6 => continue,
+                        // reconnect
+                        7 => continue,
+                        // guild member request
+                        8 => continue,
+                        // invalid session
+                        9 => continue,
+                        // hello
+                        10 => {
+                            trace!("Received hello event!");
+                            *heartbeat_interval.lock().await = Some(
+                                msg.d
+                                    .unwrap()
+                                    .get("heartbeat_interval")
+                                    .expect("Could not get heartbeat interval from hello message")
+                                    .to_string()
+                                    .parse::<isize>()
+                                    .unwrap(),
+                            );
+                            trace!(
+                                "Heartbeat interval: {}",
+                                heartbeat_interval.lock().await.unwrap()
+                            );
+                            let message = tokio_tungstenite::tungstenite::Message::Text(
+                                serde_json::json!(
+                                    {
+                                        "op": 1,
+                                        "d": heartbeat_interval.lock().await.unwrap()
+                                    }
+                                )
+                                .to_string(),
+                            );
+                            websocket_sink
+                                .lock()
+                                .await
+                                .as_mut()
+                                .unwrap()
+                                .send(message)
+                                .await
+                                .expect("Could not send initial heartbeat message");
+                            tx.send(()).await.unwrap();
+                            trace!("Hello event was ok, initial heartbeat sent");
+                            continue;
+                        }
+                        // TODO will have to handle not receiving this event when expecting to
+                        // heartbeat acknowledged
+                        11 => continue,
+                        _ => continue,
+                    }
+                }
+            }
+        });
+    }
+
+    pub async fn run(self) {
+        self.initialize().await.expect("Failed to initialize")
     }
 
     /// initialize will get the bot connected to the gateway and sending regular
     /// heartbeats
-    async fn initialize(mut self, tx: Sender<()>) -> Result<(), Box<dyn Error>> {
+    async fn initialize(mut self) -> Result<(), Box<dyn Error>> {
+        // We use this channel to alert the heartbeat loop
+        // to begin sending the heartbeat at regular intervals
+        let (tx, rx) = channel::<()>(1);
+
+        self.send_heartbeat(rx);
+
         // TODO map all the errors in this instead of using except
         // eventually should return enums
         // sending a request to get the URL for the bot gateway
@@ -192,81 +285,11 @@ impl Bot {
         trace!("Connected to discord gateway.");
 
         let (ws, _) = gateway_connection;
-        let (sink, mut stream) = ws.split();
-        *self.websocket.lock().await = Some(sink);
+        let (sink, stream) = ws.split();
+        *self.websocket_sink.lock().await = Some(sink);
+        *self.websocket_stream.lock().await = Some(stream);
 
-        // this is the event listener, and maybe should be in it's own
-        // method or function
-        while let Some(m) = stream.next().await {
-            if let Ok(msg) = &m {
-                trace!("Message received from Gateway: {}", msg.to_string());
-                let msg = serde_json::from_str::<Message>(&msg.to_string())?;
-
-                // maybe matching these methods to an enum instead of
-                // just using code comments would be better?
-                match msg.op {
-                    // dispatch code
-                    0 => continue,
-                    // heartbeat
-                    1 => continue,
-                    // identify
-                    2 => continue,
-                    // presence update
-                    3 => continue,
-                    // voice state update
-                    4 => continue,
-                    // resume
-                    6 => continue,
-                    // reconnect
-                    7 => continue,
-                    // guild member request
-                    8 => continue,
-                    // invalid session
-                    9 => continue,
-                    // hello
-                    10 => {
-                        trace!("Received hello event!");
-                        *self.heartbeat_interval.lock().await = Some(
-                            msg.d
-                                .unwrap()
-                                .get("heartbeat_interval")
-                                .expect("Could not get heartbeat interval from hello message")
-                                .to_string()
-                                .parse::<isize>()
-                                .unwrap(),
-                        );
-                        trace!(
-                            "Heartbeat interval: {}",
-                            self.heartbeat_interval.lock().await.unwrap()
-                        );
-                        let message = tokio_tungstenite::tungstenite::Message::Text(
-                            serde_json::json!(
-                                {
-                                    "op": 1,
-                                    "d": self.heartbeat_interval.lock().await.unwrap()
-                                }
-                            )
-                            .to_string(),
-                        );
-                        self.websocket
-                            .lock()
-                            .await
-                            .as_mut()
-                            .unwrap()
-                            .send(message)
-                            .await
-                            .expect("Could not send initial heartbeat message");
-                        tx.send(()).await?;
-                        trace!("Hello event was ok, initial heartbeat sent");
-                        continue;
-                    }
-                    // heartbeat acknowledged
-                    // TODO will have to handle not receiving this event when expecting to
-                    11 => continue,
-                    _ => continue,
-                }
-            }
-        }
+        self.gateway_listener(tx);
 
         Ok(())
     }
@@ -276,23 +299,4 @@ impl Bot {
 #[derive(Serialize, Deserialize)]
 struct Config {
     token: String,
-}
-
-#[derive(Serialize, Deserialize)]
-struct Message {
-    op: isize,
-    d: Option<Value>,
-    s: Option<isize>,
-    t: Option<String>,
-}
-
-#[derive(Serialize, Deserialize)]
-struct HeartbeatMessage {
-    op: isize,
-    d: HeartbeatData,
-}
-
-#[derive(Serialize, Deserialize)]
-struct HeartbeatData {
-    heartbeat_interval: isize,
 }
